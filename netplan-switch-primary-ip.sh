@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# netplan-switch-primary-ip v2.0.0
 # Безопасно переключает основной публичный IPv4 в Netplan.
 # Поддерживаемый сценарий: Ubuntu/Netplan, статические IPv4, default gateway
 # уже указан в исходном YAML, новый адрес использует ту же маску, что и старый.
@@ -232,9 +233,13 @@ main_default['to'] = '0.0.0.0/0'
 main_default['via'] = via
 main_default.pop('table', None)
 main_default['on-link'] = True
-main_default['from'] = new_cidr
+# ВАЖНО: не задаём routes.from. На Ubuntu 24.04/networkd это может
+# привести к тому, что default route вообще не будет установлен.
+# Новый IP указан первым в addresses, как в проверенной ручной конфигурации.
+main_default.pop('from', None)
 
 custom_default = dict(main_default)
+custom_default.pop('from', None)
 custom_default['table'] = 100
 
 iface['routes'] = kept_routes + [main_default, custom_default]
@@ -376,7 +381,7 @@ for _ in 1 2 3; do
   EXTERNAL_IP=$(curl -4fsS \
     --connect-timeout 8 \
     --max-time 15 \
-    -A 'netplan-switch-primary-ip/1.0' \
+    -A 'netplan-switch-primary-ip/2.0.0' \
     https://ifconfig.me/ip 2>/dev/null | tr -d '[:space:]' || true)
   [[ -n $EXTERNAL_IP ]] && break
   sleep 2
