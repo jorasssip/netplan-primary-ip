@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# netplan-primary-ip installer v3.0.0
+# netplan-primary-ip installer v3.1.0
 # Переключает основной публичный IPv4 через Netplan policy routing и умеет
 # безопасно возвращать конфигурацию к исходному единственному IPv4.
 
@@ -30,6 +30,8 @@ for required_command in netplan systemd-run systemctl ip python3 awk grep timeou
   command -v "$required_command" >/dev/null 2>&1 || die "Команда $required_command не найдена."
 done
 
+INTERACTIVE=0
+(( $# == 0 )) && INTERACTIVE=1
 MODE=${1:-}
 NEW_IP=${2:-}
 (( $# <= 2 )) || die "Слишком много аргументов. Использование: install.sh [1 NEW_IP | 2]"
@@ -93,16 +95,26 @@ RT_TMP=''
 BACKUP_DIR=''
 ROLLBACK_UNIT=''
 ROLLBACK_SCRIPT=''
+COMMIT_MARKER=''
+ROLLED_BACK_MARKER=''
+ROLLBACK_DELAY=180
+ROLLBACK_STARTED_AT=0
 MODIFIED=0
 COMMITTED=0
 ROLLBACK_SCHEDULED=0
 
 cancel_rollback_timer() {
+  local waited=0
   if (( ROLLBACK_SCHEDULED )); then
     if ! systemctl stop "$ROLLBACK_UNIT.timer" >/dev/null 2>&1; then
       return 1
     fi
-    systemctl stop "$ROLLBACK_UNIT.service" >/dev/null 2>&1 || true
+    # Сервис отката не убиваем посреди работы: даём ему закончить, иначе
+    # сеть останется в промежуточном состоянии.
+    while systemctl is-active --quiet "$ROLLBACK_UNIT.service" && (( waited < 60 )); do
+      sleep 1
+      waited=$((waited + 1))
+    done
     systemctl reset-failed "$ROLLBACK_UNIT.service" >/dev/null 2>&1 || true
     ROLLBACK_SCHEDULED=0
   fi
@@ -182,10 +194,19 @@ def table_id(value):
 
 
 def is_default(route):
-    return (
-        isinstance(route, dict)
-        and str(route.get("to", "")).strip().lower() in ("default", "0.0.0.0/0")
-    )
+    """IPv4 default route. `to: default` с IPv6-шлюзом сюда не относится."""
+    if not isinstance(route, dict):
+        return False
+    to = str(route.get("to", "")).strip().lower()
+    if to == "0.0.0.0/0":
+        return True
+    if to != "default":
+        return False
+    via = str(route.get("via") or "").strip()
+    try:
+        return ipaddress.ip_address(via).version == 4
+    except ValueError:
+        return True
 
 
 def load_records(netplan_dir):
@@ -454,15 +475,31 @@ def write_shell_metadata(path, target):
             stream.write(f"{key}={shlex.quote(str(value))}\n")
 
 
+def leading_comments(path):
+    """Комментарии в начале файла (шапка cloud-init), которые safe_dump теряет."""
+    header = []
+    with open(path, "r", encoding="utf-8") as stream:
+        for line in stream:
+            if line.lstrip().startswith("#"):
+                header.append(line if line.endswith("\n") else line + "\n")
+            elif line.strip() == "" and header:
+                continue
+            else:
+                break
+    return header
+
+
 def atomic_write(target):
     record = target["record"]
     path = record["path"]
     directory = os.path.dirname(path)
+    header = leading_comments(path)
     descriptor, temporary_path = tempfile.mkstemp(
         prefix=".netplan-primary-ip-", suffix=".yaml", dir=directory
     )
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.writelines(header)
             yaml.safe_dump(
                 record["data"],
                 stream,
@@ -549,6 +586,12 @@ def apply_change(netplan_dir, mode, new_ip, expected_path, expected_base, expect
     main_route.pop("table", None)
     main_route.pop("from", None)
     main_route["on-link"] = True
+    if mode == "1":
+        # PreferredSource для основного default route. Только голый адрес,
+        # без маски: `from: X/24` networkd не принимает и маршрут не ставится.
+        # Без этого src зависит от порядка адресов в ядре, который netplan
+        # apply не пересоздаёт, и при замене IP трафик уходит со старого адреса.
+        main_route["from"] = new_ip
     normalized_routes = kept_routes + [main_route]
     if mode == "1":
         custom_route = dict(main_route)
@@ -619,6 +662,30 @@ source "$META_FILE"
 
 say_ok "Конфигурация найдена: $NETPLAN_FILE"
 say_ok "Интерфейс: $IFACE_KEY, MAC: $MAC, gateway: $GATEWAY"
+
+find_link_by_mac() {
+  local path name mac
+  if [[ -e /sys/class/net/$IFACE_KEY/address ]] \
+    && [[ $(tr 'A-F' 'a-f' < "/sys/class/net/$IFACE_KEY/address") == "$MAC" ]]; then
+    printf '%s\n' "$IFACE_KEY"
+    return 0
+  fi
+  for path in /sys/class/net/*; do
+    name=${path##*/}
+    [[ -r $path/address ]] || continue
+    [[ -e $path/master ]] && continue
+    mac=$(tr 'A-F' 'a-f' < "$path/address")
+    if [[ $mac == "$MAC" ]]; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+  done
+  return 1
+}
+
+LINK=$(find_link_by_mac) || die "Не найден сетевой интерфейс с MAC $MAC."
+say_ok "Интерфейс в системе: $LINK"
+
 say_ok "Неизменяемый исходный IPv4: $BASE_IP/$PREFIX"
 if [[ $STATE_KIND == CUSTOM ]]; then
   say_info "Текущий дополнительный основной IPv4: $CUSTOM_IP"
@@ -669,6 +736,8 @@ STAMP=$(date -u +%Y%m%dT%H%M%SZ)-$$
 BACKUP_DIR="/root/netplan-primary-ip-backups/$STAMP"
 ROLLBACK_UNIT="netplan-primary-ip-rollback-${STAMP,,}"
 ROLLBACK_SCRIPT="$BACKUP_DIR/rollback.sh"
+COMMIT_MARKER="$BACKUP_DIR/committed"
+ROLLED_BACK_MARKER="$BACKUP_DIR/rolled-back"
 
 mkdir -p "$BACKUP_DIR"
 cp -a /etc/netplan "$BACKUP_DIR/netplan"
@@ -724,6 +793,9 @@ say_ok "Синтаксис Netplan корректен."
 BACKUP_NETPLAN_FILE="$BACKUP_DIR/netplan/$(basename "$NETPLAN_FILE")"
 {
   printf '%s\n' '#!/usr/bin/env bash' 'set -u'
+  # Если основной скрипт уже подтвердил конфигурацию — ничего не делаем.
+  printf '[[ -e %q ]] && exit 0\n' "$COMMIT_MARKER"
+  printf ': > %q\n' "$ROLLED_BACK_MARKER"
   printf 'cp -a -- %q %q\n' "$BACKUP_NETPLAN_FILE" "$NETPLAN_FILE"
   printf '%s\n' 'mkdir -p /etc/iproute2'
   if [[ -f $BACKUP_DIR/iproute2/rt_tables.existed ]]; then
@@ -738,11 +810,12 @@ chmod 700 "$ROLLBACK_SCRIPT"
 systemd-run \
   --quiet \
   --unit="$ROLLBACK_UNIT" \
-  --on-active=90s \
+  --on-active="${ROLLBACK_DELAY}s" \
   --timer-property=AccuracySec=1s \
   /bin/bash "$ROLLBACK_SCRIPT"
 ROLLBACK_SCHEDULED=1
-say_ok "Аварийный автооткат запланирован через 90 секунд."
+ROLLBACK_STARTED_AT=$SECONDS
+say_ok "Аварийный автооткат запланирован через $ROLLBACK_DELAY секунд."
 
 say_info "Применяю Netplan..."
 if ! timeout 45s netplan apply; then
@@ -750,7 +823,31 @@ if ! timeout 45s netplan apply; then
 fi
 say_ok "Netplan применён."
 
-sleep 3
+# Точное совпадение адреса на целевом интерфейсе (без ложных 1.2.3.4 ⊂ 11.2.3.4).
+has_addr() {
+  ip -4 -o addr show dev "$LINK" 2>/dev/null \
+    | awk -v ip="$1" '{ split($4, a, "/"); if (a[1] == ip) found = 1 } END { exit !found }'
+}
+
+route_src() {
+  local route_line
+  route_line=$(ip -4 route get 1.1.1.1 2>/dev/null | head -n1 || true)
+  [[ " $route_line " == *" src $1 "* ]]
+}
+
+state_ready() {
+  if [[ $MODE == 1 ]]; then
+    has_addr "$BASE_IP" && has_addr "$NEW_IP" && route_src "$NEW_IP"
+  else
+    has_addr "$BASE_IP" && { [[ -z $CUSTOM_IP ]] || ! has_addr "$CUSTOM_IP"; } && route_src "$BASE_IP"
+  fi
+}
+
+say_info "Жду, пока networkd применит адреса и маршруты (до 20 с)..."
+for _ in $(seq 1 20); do
+  state_ready && break
+  sleep 1
+done
 
 route_source_is() {
   local expected_ip=$1 route_line
@@ -767,7 +864,7 @@ verify_external_ip() {
     external_ip=$(curl -4fsS \
       --connect-timeout 8 \
       --max-time 15 \
-      -A 'netplan-primary-ip/3.0.0' \
+      -A 'netplan-primary-ip/3.1.0' \
       https://ifconfig.me/ip 2>/dev/null | tr -d '[:space:]' || true)
     [[ -n $external_ip ]] && break
     sleep 2
@@ -778,26 +875,31 @@ verify_external_ip() {
 }
 
 if [[ $MODE == 1 ]]; then
-  ip -4 addr show | grep -Fq "$BASE_IP/" || die "Исходный IPv4 исчез с интерфейса."
-  ip -4 addr show | grep -Fq "$NEW_IP/" || die "Новый IPv4 не появился на интерфейсе."
-  say_ok "Исходный и новый IPv4 назначены интерфейсу."
+  has_addr "$BASE_IP" || die "Исходный IPv4 исчез с интерфейса $LINK."
+  has_addr "$NEW_IP" || die "Новый IPv4 не появился на интерфейсе $LINK."
+  say_ok "Исходный и новый IPv4 назначены интерфейсу $LINK."
+
+  main_default_line=$(ip -4 route show table main default 2>/dev/null | head -n1 || true)
+  [[ " $main_default_line " == *" src $NEW_IP "* ]] \
+    || die "У основного default route нет src $NEW_IP: ${main_default_line:-маршрут отсутствует}"
+  say_ok "Основной default route закреплён за src $NEW_IP."
 
   ip -4 route show table 100 | grep -Eq '^default ' || die "В таблице 100 нет default route."
   say_ok "Default route в таблице 100 найден."
 
-  escaped_new_ip=${NEW_IP//./\\.}
+  escaped_new_ip=${NEW_IP//./\.}
   ip -4 rule show | grep -Eq "from ${escaped_new_ip}(/32)?[[:space:]].*lookup (100|custom)([[:space:]]|$)" \
     || die "Policy rule table 100 для нового IPv4 не найден."
   say_ok "Policy rule table 100 для $NEW_IP найден."
 
-  if [[ -n $CUSTOM_IP && $CUSTOM_IP != "$NEW_IP" ]] && ip -4 addr show | grep -Fq "$CUSTOM_IP/"; then
+  if [[ -n $CUSTOM_IP && $CUSTOM_IP != "$NEW_IP" ]] && has_addr "$CUSTOM_IP"; then
     die "Предыдущий дополнительный IPv4 $CUSTOM_IP остался на интерфейсе."
   fi
   route_source_is "$NEW_IP"
   verify_external_ip "$NEW_IP"
 else
-  ip -4 addr show | grep -Fq "$BASE_IP/" || die "Исходный IPv4 не появился на интерфейсе."
-  if ip -4 addr show | grep -Fq "$CUSTOM_IP/"; then
+  has_addr "$BASE_IP" || die "Исходный IPv4 не появился на интерфейсе $LINK."
+  if has_addr "$CUSTOM_IP"; then
     die "Дополнительный IPv4 $CUSTOM_IP остался на интерфейсе."
   fi
   if ip -4 rule show | grep -Eq 'lookup (100|custom)([[:space:]]|$)'; then
@@ -811,8 +913,15 @@ else
   verify_external_ip "$BASE_IP"
 fi
 
+if (( SECONDS - ROLLBACK_STARTED_AT >= ROLLBACK_DELAY - 5 )); then
+  die "Проверки заняли слишком много времени; автооткат мог уже начаться."
+fi
+: > "$COMMIT_MARKER"
 if ! cancel_rollback_timer; then
   die "Не удалось отменить таймер автоотката; возвращаю исходную конфигурацию."
+fi
+if [[ -e $ROLLED_BACK_MARKER ]]; then
+  die "Автооткат сработал раньше подтверждения; конфигурация не сохранена."
 fi
 COMMITTED=1
 say_ok "Автооткат отменён — проверенная конфигурация сохранена."
@@ -825,3 +934,21 @@ else
     "$OK" "$BASE_IP" "$MAC"
 fi
 printf '%s Резервная копия: %s\n' "$INFO" "$BACKUP_DIR"
+
+CLOUD_NET_DISABLE=/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+if [[ $MODE == 1 && $(basename "$NETPLAN_FILE") == 50-cloud-init.yaml && -d /etc/cloud && ! -e $CLOUD_NET_DISABLE ]]; then
+  say_warn "Файл $NETPLAN_FILE создан cloud-init. На части провайдеров cloud-init"
+  say_warn "перегенерирует его при перезагрузке, и новый IPv4 пропадёт."
+  answer=''
+  if (( INTERACTIVE )); then
+    read -r -p "Отключить управление сетью в cloud-init ($CLOUD_NET_DISABLE)? [y/N]: " answer </dev/tty || answer=''
+  fi
+  if [[ $answer == [yYдД]* ]]; then
+    mkdir -p "$(dirname "$CLOUD_NET_DISABLE")"
+    printf 'network: {config: disabled}\n' > "$CLOUD_NET_DISABLE"
+    say_ok "Создан $CLOUD_NET_DISABLE — cloud-init больше не будет трогать сеть."
+  else
+    say_info "Чтобы закрепить настройку вручную:"
+    say_info "  echo 'network: {config: disabled}' | sudo tee $CLOUD_NET_DISABLE"
+  fi
+fi
